@@ -1,38 +1,41 @@
 import asyncio
 import base64
 import json
-import websockets
 import os
+
+import websockets
 from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
+
 from kb_functions import FUNCTION_MAP
 
 load_dotenv()
 
+app = FastAPI()
 
+
+# -------- Deepgram Agent WS --------
 def sts_connect():
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if not api_key:
         raise Exception("DEEPGRAM_API_KEY not found")
 
-    sts_ws = websockets.connect(
+    return websockets.connect(
         "wss://agent.deepgram.com/v1/agent/converse",
-        subprotocols=["token", api_key]
+        subprotocols=["token", api_key],
     )
-    return sts_ws
 
 
 def load_config():
-    with open("config.json", "r") as f:
+    with open("config.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 async def handle_barge_in(decoded, twilio_ws, streamsid):
-    if decoded["type"] == "UserStartedSpeaking":
-        clear_message = {
-            "event": "clear",
-            "streamSid": streamsid
-        }
-        await twilio_ws.send(json.dumps(clear_message))
+    if decoded.get("type") == "UserStartedSpeaking":
+        clear_message = {"event": "clear", "streamSid": streamsid}
+        await twilio_ws.send_text(json.dumps(clear_message))
 
 
 def execute_function_call(func_name, arguments):
@@ -51,7 +54,7 @@ def create_function_call_response(func_id, func_name, result):
         "type": "FunctionCallResponse",
         "id": func_id,
         "name": func_name,
-        "content": json.dumps(result)
+        "content": json.dumps(result, ensure_ascii=False),
     }
 
 
@@ -73,9 +76,9 @@ async def handle_function_call_request(decoded, sts_ws):
     except Exception as e:
         print(f"Error calling function: {e}")
         error_result = create_function_call_response(
-            func_id if "func_id" in locals() else "unknown",
-            func_name if "func_name" in locals() else "unknown",
-            {"error": f"Function call failed with: {str(e)}"}
+            locals().get("func_id", "unknown"),
+            locals().get("func_name", "unknown"),
+            {"error": f"Function call failed with: {str(e)}"},
         )
         await sts_ws.send(json.dumps(error_result))
 
@@ -83,7 +86,7 @@ async def handle_function_call_request(decoded, sts_ws):
 async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
     await handle_barge_in(decoded, twilio_ws, streamsid)
 
-    if decoded["type"] == "FunctionCallRequest":
+    if decoded.get("type") == "FunctionCallRequest":
         await handle_function_call_request(decoded, sts_ws)
 
 
@@ -99,44 +102,47 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue):
     streamsid = await streamsid_queue.get()
 
     async for message in sts_ws:
-        if type(message) is str:
-            print(message)
+        if isinstance(message, str):
             decoded = json.loads(message)
             await handle_text_message(decoded, twilio_ws, sts_ws, streamsid)
             continue
 
         raw_mulaw = message
-
         media_message = {
             "event": "media",
             "streamSid": streamsid,
-            "media": {"payload": base64.b64encode(raw_mulaw).decode("ascii")}
+            "media": {"payload": base64.b64encode(raw_mulaw).decode("ascii")},
         }
-
-        await twilio_ws.send(json.dumps(media_message))
+        await twilio_ws.send_text(json.dumps(media_message))
 
 
 async def twilio_receiver(twilio_ws, audio_queue, streamsid_queue):
     BUFFER_SIZE = 20 * 160
     inbuffer = bytearray(b"")
 
-    async for message in twilio_ws:
+    while True:
+        try:
+            message = await twilio_ws.receive_text()
+        except WebSocketDisconnect:
+            break
+        except Exception:
+            break
+
         try:
             data = json.loads(message)
-            event = data["event"]
+            event = data.get("event")
 
             if event == "start":
-                print("get our streamsid")
                 start = data["start"]
                 streamsid = start["streamSid"]
                 streamsid_queue.put_nowait(streamsid)
-            elif event == "connected":
-                continue
+
             elif event == "media":
                 media = data["media"]
                 chunk = base64.b64decode(media["payload"])
-                if media["track"] == "inbound":
+                if media.get("track") == "inbound":
                     inbuffer.extend(chunk)
+
             elif event == "stop":
                 break
 
@@ -144,11 +150,12 @@ async def twilio_receiver(twilio_ws, audio_queue, streamsid_queue):
                 chunk = inbuffer[:BUFFER_SIZE]
                 audio_queue.put_nowait(chunk)
                 inbuffer = inbuffer[BUFFER_SIZE:]
-        except:
+
+        except Exception:
             break
 
 
-async def twilio_handler(twilio_ws):
+async def twilio_handler(twilio_ws: WebSocket):
     audio_queue = asyncio.Queue()
     streamsid_queue = asyncio.Queue()
 
@@ -156,35 +163,42 @@ async def twilio_handler(twilio_ws):
         config_message = load_config()
         await sts_ws.send(json.dumps(config_message))
 
-        await asyncio.wait(
-            [
-                asyncio.ensure_future(sts_sender(sts_ws, audio_queue)),
-                asyncio.ensure_future(sts_receiver(sts_ws, twilio_ws, streamsid_queue)),
-                asyncio.ensure_future(twilio_receiver(twilio_ws, audio_queue, streamsid_queue)),
-            ]
-        )
+        tasks = [
+            asyncio.create_task(sts_sender(sts_ws, audio_queue)),
+            asyncio.create_task(sts_receiver(sts_ws, twilio_ws, streamsid_queue)),
+            asyncio.create_task(twilio_receiver(twilio_ws, audio_queue, streamsid_queue)),
+        ]
 
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for t in pending:
+            t.cancel()
+
+    try:
         await twilio_ws.close()
+    except Exception:
+        pass
 
 
-async def main():
-    # Hosting (Render / VPS / etc.): bind to 0.0.0.0 and use the provided PORT.
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "5000"))
+# -------- HTTP endpoints for Render / health checks --------
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "nora-voice-agent"}
 
-    async def handler(ws):
-        # websockets will preserve the request path in ws.path
-        # We accept /stream (recommended) and / (fallback).
-        path = getattr(ws, "path", "/")
-        if path not in {"/stream", "/"}:
-            await ws.close(code=1008, reason="Invalid path")
-            return
-        await twilio_handler(ws)
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-    await websockets.serve(handler, host, port)
-    print(f"Started server on ws://{host}:{port} (path: /stream)")
-    await asyncio.Future()
+
+# -------- Twilio Media Stream WebSocket --------
+@app.websocket("/stream")
+async def stream(ws: WebSocket):
+    await ws.accept()
+    await twilio_handler(ws)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "10000"))
+    print(f"Starting HTTP+WS server on {host}:{port} (ws path: /stream)")
+    uvicorn.run(app, host=host, port=port)
