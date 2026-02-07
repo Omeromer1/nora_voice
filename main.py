@@ -6,6 +6,7 @@ import os
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from kb_functions import FUNCTION_MAP
@@ -32,7 +33,7 @@ def load_config():
         return json.load(f)
 
 
-async def handle_barge_in(decoded, twilio_ws, streamsid):
+async def handle_barge_in(decoded, twilio_ws: WebSocket, streamsid: str):
     if decoded.get("type") == "UserStartedSpeaking":
         clear_message = {"event": "clear", "streamSid": streamsid}
         await twilio_ws.send_text(json.dumps(clear_message))
@@ -43,10 +44,9 @@ def execute_function_call(func_name, arguments):
         result = FUNCTION_MAP[func_name](**arguments)
         print(f"Function call result: {result}")
         return result
-    else:
-        result = {"error": f"Unknown function: {func_name}"}
-        print(result)
-        return result
+    result = {"error": f"Unknown function: {func_name}"}
+    print(result)
+    return result
 
 
 def create_function_call_response(func_id, func_name, result):
@@ -59,6 +59,8 @@ def create_function_call_response(func_id, func_name, result):
 
 
 async def handle_function_call_request(decoded, sts_ws):
+    func_id = "unknown"
+    func_name = "unknown"
     try:
         for function_call in decoded["functions"]:
             func_name = function_call["name"]
@@ -76,28 +78,27 @@ async def handle_function_call_request(decoded, sts_ws):
     except Exception as e:
         print(f"Error calling function: {e}")
         error_result = create_function_call_response(
-            locals().get("func_id", "unknown"),
-            locals().get("func_name", "unknown"),
+            func_id,
+            func_name,
             {"error": f"Function call failed with: {str(e)}"},
         )
         await sts_ws.send(json.dumps(error_result))
 
 
-async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
+async def handle_text_message(decoded, twilio_ws: WebSocket, sts_ws, streamsid: str):
     await handle_barge_in(decoded, twilio_ws, streamsid)
-
     if decoded.get("type") == "FunctionCallRequest":
         await handle_function_call_request(decoded, sts_ws)
 
 
-async def sts_sender(sts_ws, audio_queue):
+async def sts_sender(sts_ws, audio_queue: asyncio.Queue):
     print("sts_sender started")
     while True:
         chunk = await audio_queue.get()
         await sts_ws.send(chunk)
 
 
-async def sts_receiver(sts_ws, twilio_ws, streamsid_queue):
+async def sts_receiver(sts_ws, twilio_ws: WebSocket, streamsid_queue: asyncio.Queue):
     print("sts_receiver started")
     streamsid = await streamsid_queue.get()
 
@@ -116,7 +117,7 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue):
         await twilio_ws.send_text(json.dumps(media_message))
 
 
-async def twilio_receiver(twilio_ws, audio_queue, streamsid_queue):
+async def twilio_receiver(twilio_ws: WebSocket, audio_queue: asyncio.Queue, streamsid_queue: asyncio.Queue):
     BUFFER_SIZE = 20 * 160
     inbuffer = bytearray(b"")
 
@@ -170,7 +171,6 @@ async def twilio_handler(twilio_ws: WebSocket):
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
         for t in pending:
             t.cancel()
 
@@ -181,9 +181,10 @@ async def twilio_handler(twilio_ws: WebSocket):
 
 
 # -------- HTTP endpoints for Render / health checks --------
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "nora-voice-agent"}
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root():
+    return JSONResponse({"status": "ok", "service": "nora-voice-agent"})
+
 
 @app.get("/health")
 def health():
