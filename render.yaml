@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nora-voice-agent
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: KB_DOCX_PATH
+        value: PSAU_Knowledge_Base.docx
+      - key: KB_MIN_OVERLAP
+        value: "2"
+      - key: KB_MAX_CHARS
+        value: "600"
